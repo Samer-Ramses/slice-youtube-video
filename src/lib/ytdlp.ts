@@ -130,6 +130,9 @@ function runProcess(
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
+        if (stderr.trim()) {
+          console.error("[yt-dlp stderr]\n" + stderr.trim().slice(-1200));
+        }
         const message =
           stderr
             .split(/\r?\n/)
@@ -187,17 +190,27 @@ async function getCookiesArgs(): Promise<string[]> {
   return ["--cookies", cookiePath];
 }
 
+function getCommonYtDlpArgs(): string[] {
+  return [
+    "-4",
+    "--js-runtimes",
+    "deno",
+    "--js-runtimes",
+    "node",
+    "--remote-components",
+    "ejs:github",
+    "--no-playlist",
+  ];
+}
+
 export async function getVideoInfo(url: string): Promise<VideoInfo> {
   const ytdlp = await ensureYtDlp();
   const cookieArgs = await getCookiesArgs();
   const args = [
-    "-4",
-    "--js-runtimes",
-    "node",
+    ...getCommonYtDlpArgs(),
     ...cookieArgs,
     "--dump-single-json",
-    "--no-playlist",
-    "--no-warnings",
+    "--ignore-no-formats-error",
     "--skip-download",
     url,
   ];
@@ -248,16 +261,12 @@ export async function sliceYouTubeVideo(
     const maxHeight = Number(process.env.MAX_HEIGHT || 0);
     const formatSelector =
       maxHeight > 0
-        ? `bv*[height<=${maxHeight}][ext=mp4]+ba[ext=m4a]/b[height<=${maxHeight}][ext=mp4]/bv*[height<=${maxHeight}]+ba/b`
-        : "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
+        ? `bv*[height<=${maxHeight}][ext=mp4]+ba[ext=m4a]/b[height<=${maxHeight}][ext=mp4]/bv*[height<=${maxHeight}]+ba/bv*+ba/b/best`
+        : "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b/best";
     const section = `*${startSeconds}-${endSeconds}`;
     const args = [
-      "-4",
-      "--js-runtimes",
-      "node",
+      ...getCommonYtDlpArgs(),
       ...cookieArgs,
-      "--no-playlist",
-      "--no-warnings",
       "--ffmpeg-location",
       ffmpeg,
       "--download-sections",

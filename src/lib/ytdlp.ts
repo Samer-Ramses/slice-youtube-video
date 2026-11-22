@@ -151,11 +151,21 @@ export interface VideoInfo {
   channel: string;
 }
 
+function isEmptyOrPlaceholder(val?: string): boolean {
+  if (!val) return true;
+  const t = val.trim().toLowerCase();
+  return !t || t === "none" || t === "null" || t === "false";
+}
+
 async function getCookiesArgs(): Promise<string[]> {
-  const raw =
-    process.env.YTDLP_COOKIES_BASE64
-      ? Buffer.from(process.env.YTDLP_COOKIES_BASE64, "base64").toString("utf8")
-      : process.env.YTDLP_COOKIES;
+  const b64 = process.env.YTDLP_COOKIES_BASE64;
+  const plain = process.env.YTDLP_COOKIES;
+
+  const raw = !isEmptyOrPlaceholder(b64)
+    ? Buffer.from(b64!.trim(), "base64").toString("utf8")
+    : !isEmptyOrPlaceholder(plain)
+      ? plain!.trim()
+      : "";
 
   if (!raw || !raw.trim()) return [];
 

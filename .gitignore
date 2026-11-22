@@ -1,0 +1,8 @@
+node_modules/
+.next/
+out/
+bin/
+.tmp/
+.env*.local
+npm-debug.log*
+*.tsbuildinfo

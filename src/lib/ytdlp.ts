@@ -162,12 +162,25 @@ async function getCookiesArgs(): Promise<string[]> {
   const plain = process.env.YTDLP_COOKIES;
 
   const raw = !isEmptyOrPlaceholder(b64)
-    ? Buffer.from(b64!.trim(), "base64").toString("utf8")
+    ? Buffer.from(b64!.replace(/\s+/g, ""), "base64").toString("utf8")
     : !isEmptyOrPlaceholder(plain)
       ? plain!.trim()
       : "";
 
-  if (!raw || !raw.trim()) return [];
+  if (!raw || !raw.trim()) {
+    console.log("[yt-dlp] No cookies configured.");
+    return [];
+  }
+
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith("#"));
+  const hasAuth =
+    raw.includes("SAPISID") ||
+    raw.includes("LOGIN_INFO") ||
+    raw.includes("__Secure-3PSID");
+
+  console.log(
+    `[yt-dlp] Loaded cookies: ${lines.length} entries, hasYouTubeAuth=${hasAuth}`
+  );
 
   const cookiePath = path.join(os.tmpdir(), "yt-dlp-cookies.txt");
   await fsp.writeFile(cookiePath, raw, "utf8");
@@ -178,6 +191,9 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
   const ytdlp = await ensureYtDlp();
   const cookieArgs = await getCookiesArgs();
   const args = [
+    "-4",
+    "--js-runtimes",
+    "node",
     ...cookieArgs,
     "--dump-single-json",
     "--no-playlist",
@@ -236,6 +252,9 @@ export async function sliceYouTubeVideo(
         : "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
     const section = `*${startSeconds}-${endSeconds}`;
     const args = [
+      "-4",
+      "--js-runtimes",
+      "node",
       ...cookieArgs,
       "--no-playlist",
       "--no-warnings",

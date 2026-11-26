@@ -182,6 +182,91 @@ export interface VideoInfo {
   channel: string;
 }
 
+const infoCache = new Map<string, { data: VideoInfo; expiresAt: number }>();
+const INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function parseIsoDuration(iso: string): number {
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/i);
+  if (!m) return 0;
+  return Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
+}
+
+async function getFastVideoInfo(
+  url: string,
+  videoId: string
+): Promise<VideoInfo | null> {
+  try {
+    const [oembedRes, pageRes] = await Promise.all([
+      fetch(
+        `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`,
+        { signal: AbortSignal.timeout(6_000) }
+      ).catch(() => null),
+      fetch(url, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Accept-Language": "ar,en;q=0.9",
+          Cookie: "SOCS=CAI",
+        },
+        signal: AbortSignal.timeout(6_000),
+      }).catch(() => null),
+    ]);
+
+    const oembed =
+      oembedRes && oembedRes.ok
+        ? ((await oembedRes.json().catch(() => null)) as {
+            title?: string;
+            author_name?: string;
+            thumbnail_url?: string;
+          } | null)
+        : null;
+
+    const html = pageRes && pageRes.ok ? await pageRes.text() : "";
+
+    let duration = 0;
+    const vdMatch = html.match(
+      /"videoDetails":\{[\s\S]{0,1500}?"lengthSeconds":"(\d+)"/
+    );
+    if (vdMatch) {
+      duration = Number(vdMatch[1]);
+    } else {
+      const lenMatch = html.match(/"lengthSeconds":"(\d+)"/);
+      if (lenMatch) {
+        duration = Number(lenMatch[1]);
+      } else {
+        const metaMatch = html.match(
+          /itemprop="duration"\s+content="(PT[^"]+)"/i
+        );
+        if (metaMatch) {
+          duration = parseIsoDuration(metaMatch[1]);
+        }
+      }
+    }
+
+    let title = oembed?.title ?? "";
+    if (!title && html) {
+      const ogTitle = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+      if (ogTitle) title = ogTitle[1];
+    }
+
+    if (!title || duration <= 0) {
+      return null;
+    }
+
+    return {
+      id: videoId,
+      title,
+      duration,
+      thumbnail:
+        oembed?.thumbnail_url ||
+        `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      channel: oembed?.author_name || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
 function isEmptyOrPlaceholder(val?: string): boolean {
   if (!val) return true;
   const t = val.trim().toLowerCase();
@@ -245,6 +330,25 @@ function getCommonYtDlpArgs(): string[] {
 }
 
 export async function getVideoInfo(url: string): Promise<VideoInfo> {
+  const idMatch = url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+  const videoId = idMatch?.[1] ?? "";
+
+  if (videoId) {
+    const cached = infoCache.get(videoId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+
+    const fast = await getFastVideoInfo(url, videoId);
+    if (fast) {
+      infoCache.set(videoId, {
+        data: fast,
+        expiresAt: Date.now() + INFO_CACHE_TTL_MS,
+      });
+      return fast;
+    }
+  }
+
   const ytdlp = await ensureYtDlp();
   const cookieArgs = await getCookiesArgs();
   const args = [
@@ -258,8 +362,8 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
   const { stdout } = await runProcess(ytdlp, args, 45_000);
   const data = JSON.parse(stdout);
 
-  return {
-    id: String(data.id ?? ""),
+  const info: VideoInfo = {
+    id: String(data.id ?? videoId),
     title: String(data.title ?? "YouTube Video"),
     duration: Number(data.duration ?? 0),
     thumbnail: String(
@@ -267,6 +371,15 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
     ),
     channel: String(data.channel ?? data.uploader ?? ""),
   };
+
+  if (info.id && info.duration > 0) {
+    infoCache.set(info.id, {
+      data: info,
+      expiresAt: Date.now() + INFO_CACHE_TTL_MS,
+    });
+  }
+
+  return info;
 }
 
 export interface SliceProgress {
@@ -377,6 +490,7 @@ export async function sliceYouTubeVideo(
         return;
       }
 
+      // FFmpeg progress: time=00:00:05.12 ... speed=1.45x
       const timeMatch = line.match(/time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
       if (timeMatch) {
         if (!processingStartedAt) processingStartedAt = Date.now();
@@ -405,6 +519,7 @@ export async function sliceYouTubeVideo(
         return;
       }
 
+      // yt-dlp standard download progress: [download]  42.3% ... ETA 00:05
       const dlMatch = line.match(/\[download\]\s+([\d.]+)%/);
       if (dlMatch) {
         const dlPct = Number(dlMatch[1]);

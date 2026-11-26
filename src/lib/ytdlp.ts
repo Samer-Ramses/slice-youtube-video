@@ -133,6 +133,14 @@ function runProcess(
         if (stderr.trim()) {
           console.error("[yt-dlp stderr]\n" + stderr.trim().slice(-1200));
         }
+        if (stderr.includes("cookies are no longer valid")) {
+          reject(
+            new Error(
+              "انتهت صلاحية كوكيز يوتيوب على السيرفر. يرجى تحديث YTDLP_COOKIES_BASE64 أو حذفها."
+            )
+          );
+          return;
+        }
         const message =
           stderr
             .split(/\r?\n/)
@@ -191,7 +199,7 @@ async function getCookiesArgs(): Promise<string[]> {
 }
 
 function getCommonYtDlpArgs(): string[] {
-  return [
+  const args = [
     "-4",
     "--js-runtimes",
     "deno",
@@ -201,6 +209,16 @@ function getCommonYtDlpArgs(): string[] {
     "ejs:github",
     "--no-playlist",
   ];
+
+  const bgutilHome = process.env.BGUTIL_SERVER_HOME;
+  if (bgutilHome && fs.existsSync(bgutilHome)) {
+    args.push(
+      "--extractor-args",
+      `youtubepot-bgutilscript:server_home=${bgutilHome}`
+    );
+  }
+
+  return args;
 }
 
 export async function getVideoInfo(url: string): Promise<VideoInfo> {
@@ -210,7 +228,6 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
     ...getCommonYtDlpArgs(),
     ...cookieArgs,
     "--dump-single-json",
-    "--ignore-no-formats-error",
     "--skip-download",
     url,
   ];

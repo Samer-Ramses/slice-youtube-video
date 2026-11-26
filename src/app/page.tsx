@@ -15,6 +15,24 @@ interface VideoInfo {
   channel: string;
 }
 
+interface ProgressState {
+  percent: number;
+  stage: string;
+  etaSeconds: number | null;
+}
+
+function formatEta(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds <= 0) {
+    return "جاري الحساب...";
+  }
+  if (seconds < 60) {
+    return `~${Math.ceil(seconds)} ثانية`;
+  }
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.ceil(seconds % 60);
+  return secs > 0 ? `~${mins} د ${secs} ث` : `~${mins} دقيقة`;
+}
+
 export default function HomePage() {
   const [url, setUrl] = useState("");
   const [video, setVideo] = useState<VideoInfo | null>(null);
@@ -22,8 +40,10 @@ export default function HomePage() {
   const [endSec, setEndSec] = useState(15);
   const [startInput, setStartInput] = useState("00:00");
   const [endInput, setEndInput] = useState("00:15");
+  const [preciseCut, setPreciseCut] = useState(false);
   const [loadingInfo, setLoadingInfo] = useState(false);
   const [slicing, setSlicing] = useState(false);
+  const [progress, setProgress] = useState<ProgressState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
@@ -31,6 +51,7 @@ export default function HomePage() {
     e.preventDefault();
     setError(null);
     setStatus(null);
+    setProgress(null);
 
     const id = extractYouTubeId(url);
     if (!id) {
@@ -95,23 +116,81 @@ export default function HomePage() {
     updateEnd(Math.floor(parsed));
   }
 
+  async function downloadReadyClip(
+    jobId: string,
+    fileName: string,
+    expectedSize: number
+  ) {
+    const dlRes = await fetch(`/api/slice/download/${encodeURIComponent(jobId)}`);
+    if (!dlRes.ok) {
+      const data = await dlRes.json().catch(() => ({}));
+      throw new Error(data.error || "تعذر تحميل الملف المقصوص.");
+    }
+
+    const total = Number(dlRes.headers.get("Content-Length")) || expectedSize;
+    const reader = dlRes.body?.getReader();
+
+    let blob: Blob;
+    if (reader && total > 0) {
+      const chunks: BlobPart[] = [];
+      let received = 0;
+      const startedAt = Date.now();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(new Uint8Array(value));
+          received += value.byteLength;
+          const dlRatio = Math.min(1, received / total);
+          const elapsedSec = Math.max(0.1, (Date.now() - startedAt) / 1000);
+          const speedBps = received / elapsedSec;
+          const eta = speedBps > 0 ? (total - received) / speedBps : 1;
+
+          setProgress({
+            percent: Math.min(100, Math.round(94 + dlRatio * 6)),
+            stage: `جاري تنزيل الملف (${(received / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB)`,
+            etaSeconds: eta,
+          });
+        }
+      }
+      blob = new Blob(chunks, { type: "video/mp4" });
+    } else {
+      blob = await dlRes.blob();
+    }
+
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(downloadUrl);
+  }
+
   async function handleSliceDownload() {
     if (!video) return;
     setError(null);
-    setStatus("جاري قص الجزء المطلوب وتجهيز التحميل...");
+    setStatus(null);
 
     const parsedStart = parseTimeToSeconds(startInput) ?? startSec;
     const parsedEnd = parseTimeToSeconds(endInput) ?? endSec;
 
     if (parsedEnd <= parsedStart) {
-      setStatus(null);
       setError("وقت النهاية يجب أن يكون أكبر من وقت البداية.");
       return;
     }
 
     setSlicing(true);
+    setProgress({
+      percent: 5,
+      stage: "جاري إرسال الطلب للسيرفر...",
+      etaSeconds: null,
+    });
+
     try {
-      const res = await fetch("/api/slice", {
+      const res = await fetch("/api/slice/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -119,34 +198,74 @@ export default function HomePage() {
           start: parsedStart,
           end: parsedEnd,
           title: video.title,
+          precise: preciseCut,
         }),
       });
 
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || "فشل قص الفيديو.");
+        throw new Error(data.error || "فشل بدء قص الفيديو.");
       }
 
-      const blob = await res.blob();
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = downloadUrl;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let readyJob: { jobId: string; fileName: string; size: number } | null =
+        null;
 
-      const startLabel = formatSeconds(parsedStart).replace(/:/g, "-");
-      const endLabel = formatSeconds(parsedEnd).replace(/:/g, "-");
-      const safeTitle = video.title
-        .replace(/[<>:"/\\|?*]/g, "")
-        .trim()
-        .slice(0, 70);
-      a.download = `${safeTitle || "youtube-clip"} (${startLabel}-${endLabel}).mp4`;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(downloadUrl);
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
 
+        for (const rawEvent of events) {
+          const dataLine = rawEvent
+            .split("\n")
+            .find((l) => l.startsWith("data: "));
+          if (!dataLine) continue;
+
+          const event = JSON.parse(dataLine.slice(6));
+          if (event.type === "progress") {
+            setProgress({
+              percent: event.percent,
+              stage: event.stage,
+              etaSeconds: event.etaSeconds ?? null,
+            });
+          } else if (event.type === "done") {
+            readyJob = {
+              jobId: event.jobId,
+              fileName: event.fileName,
+              size: event.size,
+            };
+          } else if (event.type === "error") {
+            throw new Error(event.error || "حدث خطأ أثناء قص الفيديو.");
+          }
+        }
+      }
+
+      if (!readyJob) {
+        throw new Error("انقطع الاتصال قبل اكتمال قص الفيديو.");
+      }
+
+      setProgress({
+        percent: 94,
+        stage: "جاري حفظ الفيديو على جهازك...",
+        etaSeconds: 1,
+      });
+
+      await downloadReadyClip(readyJob.jobId, readyJob.fileName, readyJob.size);
+
+      setProgress({
+        percent: 100,
+        stage: "اكتمل التحميل!",
+        etaSeconds: 0,
+      });
       setStatus("تم قص الفيديو وحفظه على جهازك بنجاح.");
     } catch (err) {
+      setProgress(null);
       setStatus(null);
       setError(err instanceof Error ? err.message : "حدث خطأ أثناء التحميل.");
     } finally {
@@ -304,7 +423,50 @@ export default function HomePage() {
                   {formatSeconds(clipLength)}
                 </span>
               </div>
+
+              <label className="flex cursor-pointer items-center justify-between gap-3 border-t border-zinc-800/80 pt-3 text-xs text-zinc-300">
+                <span>
+                  قص دقيق بالثانية{" "}
+                  <span className="text-zinc-500">(أبطأ — يعيد ترميز الفيديو)</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={preciseCut}
+                  onChange={(e) => setPreciseCut(e.target.checked)}
+                  disabled={slicing}
+                  className="h-4 w-4 accent-red-600"
+                />
+              </label>
             </div>
+
+            {progress && (
+              <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/80 p-4">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium text-zinc-200">
+                    {progress.stage}
+                  </span>
+                  <span dir="ltr" className="font-mono font-semibold text-red-400">
+                    {progress.percent}%
+                  </span>
+                </div>
+
+                <div className="h-2.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-l from-red-500 to-rose-600 transition-all duration-300"
+                    style={{ width: `${progress.percent}%` }}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                  <span>
+                    {progress.percent < 100
+                      ? `الوقت المتبقي: ${formatEta(progress.etaSeconds)}`
+                      : "تم حفظ الملف بنجاح"}
+                  </span>
+                  <span>{preciseCut ? "وضع دقيق" : "وضع سريع ⚡"}</span>
+                </div>
+              </div>
+            )}
 
             <button
               type="button"
@@ -315,7 +477,7 @@ export default function HomePage() {
               {slicing ? (
                 <>
                   <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                  <span>جاري القص والتحميل...</span>
+                  <span>جاري القص والتحميل ({progress?.percent ?? 0}%)...</span>
                 </>
               ) : (
                 <span>قص وحفظ الفيديو (MP4)</span>

@@ -97,7 +97,8 @@ export async function ensureYtDlp(): Promise<string> {
 function runProcess(
   bin: string,
   args: string[],
-  timeoutMs = 180_000
+  timeoutMs = 180_000,
+  onOutputLine?: (line: string) => void
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -107,12 +108,28 @@ function runProcess(
 
     let stdout = "";
     let stderr = "";
+    let lineBuf = "";
+
+    const feedLines = (text: string) => {
+      if (!onOutputLine) return;
+      lineBuf += text;
+      const parts = lineBuf.split(/[\r\n]+/);
+      lineBuf = parts.pop() ?? "";
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed) onOutputLine(trimmed);
+      }
+    };
 
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      feedLines(text);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      feedLines(text);
     });
 
     const timer = setTimeout(() => {
@@ -127,6 +144,9 @@ function runProcess(
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (lineBuf.trim() && onOutputLine) {
+        onOutputLine(lineBuf.trim());
+      }
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
@@ -249,17 +269,35 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
   };
 }
 
+export interface SliceProgress {
+  percent: number;
+  stage: string;
+  etaSeconds: number | null;
+}
+
+export interface SliceOptions {
+  precise?: boolean;
+  onProgress?: (progress: SliceProgress) => void;
+}
+
 export interface SliceResult {
   filePath: string;
   tempDir: string;
   cleanup: () => Promise<void>;
 }
 
+function parseHmsToSeconds(hms: string): number {
+  const [h, m, s] = hms.split(":").map(Number);
+  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+}
+
 export async function sliceYouTubeVideo(
   url: string,
   startSeconds: number,
-  endSeconds: number
+  endSeconds: number,
+  options: SliceOptions = {}
 ): Promise<SliceResult> {
+  const { precise = false, onProgress } = options;
   const ytdlp = await ensureYtDlp();
   const ffmpeg = findFfmpegPath();
 
@@ -276,6 +314,28 @@ export async function sliceYouTubeVideo(
     await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   };
 
+  const clipDuration = Math.max(1, endSeconds - startSeconds);
+  let lastPercent = 8;
+  let lastEmitAt = 0;
+  let processingStartedAt: number | null = null;
+
+  const emitProgress = (
+    percent: number,
+    stage: string,
+    etaSeconds: number | null,
+    force = false
+  ) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    const clamped = Math.max(lastPercent, Math.min(95, Math.round(percent)));
+    if (!force && clamped === lastPercent && now - lastEmitAt < 500) return;
+    lastPercent = clamped;
+    lastEmitAt = now;
+    onProgress({ percent: clamped, stage, etaSeconds });
+  };
+
+  emitProgress(8, "جاري الاتصال بيوتيوب وتجهيز المقطع...", null, true);
+
   try {
     const cookieArgs = await getCookiesArgs();
     const maxHeight = Number(process.env.MAX_HEIGHT || 0);
@@ -284,14 +344,19 @@ export async function sliceYouTubeVideo(
         ? `bv*[height<=${maxHeight}][ext=mp4]+ba[ext=m4a]/b[height<=${maxHeight}][ext=mp4]/bv*[height<=${maxHeight}]+ba/bv*+ba/b/best`
         : "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b/best";
     const section = `*${startSeconds}-${endSeconds}`;
+
     const args = [
       ...getCommonYtDlpArgs(),
       ...cookieArgs,
+      "--newline",
+      "--progress",
       "--ffmpeg-location",
       ffmpeg,
       "--download-sections",
       section,
-      "--force-keyframes-at-cuts",
+      ...(precise ? ["--force-keyframes-at-cuts"] : []),
+      "--downloader-args",
+      "ffmpeg:-stats -stats_period 0.5",
       "-f",
       formatSelector,
       "--merge-output-format",
@@ -301,7 +366,58 @@ export async function sliceYouTubeVideo(
       url,
     ];
 
-    await runProcess(ytdlp, args, 300_000);
+    await runProcess(ytdlp, args, 300_000, (line) => {
+      if (line.includes("[info]") || line.includes("Downloading 1 format")) {
+        emitProgress(16, "جاري سحب وقص الجزء المحدد...", null, true);
+        return;
+      }
+
+      if (line.includes("[Merger]") || line.includes("Merging formats")) {
+        emitProgress(90, "جاري دمج الصوت والصورة...", 2, true);
+        return;
+      }
+
+      const timeMatch = line.match(/time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
+      if (timeMatch) {
+        if (!processingStartedAt) processingStartedAt = Date.now();
+        const doneSec = parseHmsToSeconds(timeMatch[1]);
+        const ratio = Math.min(1, Math.max(0, doneSec / clipDuration));
+        const pct = 18 + ratio * 70;
+
+        let eta: number | null = null;
+        const speedMatch = line.match(/speed=\s*([\d.]+)x/);
+        const speed = speedMatch ? Number(speedMatch[1]) : 0;
+        if (speed > 0.05) {
+          eta = Math.max(1, Math.ceil((clipDuration - doneSec) / speed) + 2);
+        } else if (ratio > 0.05) {
+          const elapsedSec = (Date.now() - processingStartedAt) / 1000;
+          eta = Math.max(
+            1,
+            Math.ceil((elapsedSec / ratio) * (1 - ratio)) + 2
+          );
+        }
+
+        emitProgress(
+          pct,
+          precise ? "جاري القص الدقيق وإعادة الترميز..." : "جاري قص الفيديو...",
+          eta
+        );
+        return;
+      }
+
+      const dlMatch = line.match(/\[download\]\s+([\d.]+)%/);
+      if (dlMatch) {
+        const dlPct = Number(dlMatch[1]);
+        if (Number.isFinite(dlPct)) {
+          let eta: number | null = null;
+          const etaMatch = line.match(/ETA\s+(\d{2}):(\d{2})/);
+          if (etaMatch) {
+            eta = Number(etaMatch[1]) * 60 + Number(etaMatch[2]) + 2;
+          }
+          emitProgress(18 + (dlPct / 100) * 70, "جاري سحب وقص المقطع...", eta);
+        }
+      }
+    });
 
     const files = await fsp.readdir(tempDir);
     const mediaFile =
@@ -311,6 +427,8 @@ export async function sliceYouTubeVideo(
     if (!mediaFile) {
       throw new Error("لم يتم إنتاج ملف الفيديو المقصوص.");
     }
+
+    emitProgress(94, "تم تجهيز الفيديو! جاري بدء التحميل...", 1, true);
 
     return {
       filePath: path.join(tempDir, mediaFile),

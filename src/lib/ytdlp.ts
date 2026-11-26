@@ -210,12 +210,15 @@ function getCommonYtDlpArgs(): string[] {
     "--no-playlist",
   ];
 
+  const extractorArgs: string[] = [];
   const bgutilHome = process.env.BGUTIL_SERVER_HOME;
   if (bgutilHome && fs.existsSync(bgutilHome)) {
-    args.push(
-      "--extractor-args",
-      `youtubepot-bgutilscript:server_home=${bgutilHome}`
-    );
+    extractorArgs.push(`youtubepot-bgutilscript:server_home=${bgutilHome}`);
+    extractorArgs.push("youtube:player_client=mweb,tv,web");
+  }
+
+  if (extractorArgs.length > 0) {
+    args.push("--extractor-args", extractorArgs.join(";"));
   }
 
   return args;
